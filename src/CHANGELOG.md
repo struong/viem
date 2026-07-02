@@ -1,5 +1,11 @@
 # viem
 
+## 2.54.2
+
+### Patch Changes
+
+- [#4784](https://github.com/wevm/viem/pull/4784) [`404a11944045b88405fec20b52f8d9b7fa727056`](https://github.com/wevm/viem/commit/404a11944045b88405fec20b52f8d9b7fa727056) Thanks [@decofe](https://github.com/decofe)! - Added Storage Credits (TIP-1060) precompile ABI & address to Tempo exports.
+
 ## 2.54.1
 
 ### Patch Changes
