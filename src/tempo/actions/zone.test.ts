@@ -1,3 +1,4 @@
+import * as Hex from 'ox/Hex'
 import * as PublicKey from 'ox/PublicKey'
 import * as Secp256k1 from 'ox/Secp256k1'
 import { createClient } from 'viem'
@@ -8,7 +9,11 @@ import { describe, expect, test } from 'vitest'
 import { accounts } from '~test/constants.js'
 import { http } from '~test/tempo/config.js'
 import { getClient as getZoneClient } from '~test/tempo/zones.js'
+import { custom } from '../../clients/transports/custom.js'
+import { decodeFunctionData } from '../../utils/abi/decodeFunctionData.js'
+import { encodeFunctionResult } from '../../utils/abi/encodeFunctionResult.js'
 import * as Storage from '../Storage.js'
+import * as ZoneAbis from '../zones/Abis.js'
 import * as zoneActions from './zone.js'
 
 const account = privateKeyToAccount(accounts[0].privateKey)
@@ -19,6 +24,53 @@ const mainnetClient = createClient({
   transport: http(),
 })
 const zoneClient = getZoneClient({ account })
+
+function getPortalClient({
+  keyCount = 2n,
+  requests = [],
+}: {
+  keyCount?: bigint | undefined
+  requests?: unknown[] | undefined
+} = {}) {
+  const { publicKey } = Secp256k1.createKeyPair()
+  const compressedPublicKey = PublicKey.compress(publicKey)
+
+  return createClient({
+    chain: tempoModerato,
+    transport: custom({
+      async request(request) {
+        requests.push(request)
+
+        if (request.method !== 'eth_call') return null
+
+        const [{ data }] = request.params as [{ data: `0x${string}` }]
+        const decoded = decodeFunctionData({
+          abi: ZoneAbis.zonePortal,
+          data,
+        })
+
+        if (decoded.functionName === 'sequencerEncryptionKey')
+          return encodeFunctionResult({
+            abi: ZoneAbis.zonePortal,
+            functionName: 'sequencerEncryptionKey',
+            result: [
+              Hex.fromNumber(compressedPublicKey.x, { size: 32 }),
+              compressedPublicKey.prefix,
+            ],
+          })
+
+        if (decoded.functionName === 'encryptionKeyCount')
+          return encodeFunctionResult({
+            abi: ZoneAbis.zonePortal,
+            functionName: 'encryptionKeyCount',
+            result: keyCount,
+          })
+
+        return null
+      },
+    }),
+  })
+}
 
 describe('signAuthorizationToken', () => {
   test('behavior: signs and stores token', async () => {
@@ -132,6 +184,73 @@ describe('getWithdrawalFee', () => {
   })
 })
 
+describe('prepareEncryptedDeposit', () => {
+  test('default', async () => {
+    const requests: unknown[] = []
+    const prepared = await zoneActions.prepareEncryptedDeposit(
+      getPortalClient({ requests }),
+      {
+        token: '0x20c0000000000000000000000000000000000000',
+        amount: parseUnits('1', 6),
+        recipient: account.address,
+        memo: Hex.fromNumber(1n, { size: 32 }),
+        zoneId: 7,
+      },
+    )
+
+    expect(requests).toHaveLength(2)
+    expect(requests).toMatchObject([
+      { method: 'eth_call' },
+      { method: 'eth_call' },
+    ])
+    expect(prepared.amount).toBe(parseUnits('1', 6))
+    expect(prepared.chainId).toBe(tempoModerato.id)
+    expect(prepared.keyIndex).toBe(1n)
+    expect(prepared.portalAddress).toBeDefined()
+    expect(prepared.token).toBe('0x20c0000000000000000000000000000000000000')
+    expect(prepared.zoneId).toBe(7)
+    expect(prepared.encrypted.ciphertext).toBeDefined()
+    expect(prepared.encrypted.ephemeralPubkeyX).toBeDefined()
+    expect(prepared.encrypted.nonce).toBeDefined()
+    expect(prepared.encrypted.tag).toBeDefined()
+    expect('recipient' in prepared).toBe(false)
+    expect('memo' in prepared).toBe(false)
+
+    const calls = zoneActions.encryptedDeposit.calls(prepared)
+    expect(calls[0].args).toEqual([prepared.portalAddress, parseUnits('1', 6)])
+    expect(calls[1].address).toBe(prepared.portalAddress)
+    expect(calls[1].functionName).toBe('depositEncrypted')
+    expect(calls[1].args[2]).toBe(prepared.keyIndex)
+    expect(calls[1].args[3]).toEqual(prepared.encrypted)
+  })
+
+  test('behavior: creates a fresh payload each time', async () => {
+    const client = getPortalClient()
+    const parameters = {
+      token: '0x20c0000000000000000000000000000000000000',
+      amount: parseUnits('1', 6),
+      recipient: account.address,
+      zoneId: 7,
+    } as const
+
+    const first = await zoneActions.prepareEncryptedDeposit(client, parameters)
+    const second = await zoneActions.prepareEncryptedDeposit(client, parameters)
+
+    expect(first.encrypted).not.toEqual(second.encrypted)
+  })
+
+  test('error: no sequencer encryption key', async () => {
+    await expect(
+      zoneActions.prepareEncryptedDeposit(getPortalClient({ keyCount: 0n }), {
+        token: '0x20c0000000000000000000000000000000000000',
+        amount: 1n,
+        recipient: account.address,
+        zoneId: 7,
+      }),
+    ).rejects.toThrow('No sequencer encryption key configured.')
+  })
+})
+
 describe('encryptedDeposit', () => {
   // TODO: unskip once zone contracts support encrypted deposits
   test.skip('behavior: deposits tokens into zone with encrypted recipient', async () => {
@@ -160,6 +279,27 @@ describe('encryptedDeposit', () => {
         zoneId: 7,
       }),
     ).rejects.toThrow('`account` is required.')
+  })
+
+  test('error: prepared deposit chain mismatch', async () => {
+    const prepared = await zoneActions.prepareEncryptedDeposit(
+      getPortalClient(),
+      {
+        token: '0x20c0000000000000000000000000000000000000',
+        amount: 1n,
+        recipient: account.address,
+        zoneId: 7,
+      },
+    )
+
+    await expect(
+      zoneActions.encryptedDeposit(mainnetClient, {
+        ...prepared,
+        chainId: prepared.chainId + 1,
+      }),
+    ).rejects.toThrow(
+      'Prepared encrypted deposit chain ID does not match client chain.',
+    )
   })
 })
 
