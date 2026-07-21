@@ -7,13 +7,17 @@ import * as getBlock from '../../actions/public/getBlock.js'
 import { mine } from '../../actions/test/mine.js'
 import { setBalance } from '../../actions/test/setBalance.js'
 import { setNextBlockBaseFeePerGas } from '../../actions/test/setNextBlockBaseFeePerGas.js'
+import { tempoLocalnet } from '../../chains/definitions/tempoLocalnet.js'
 import {
   BaseError,
   createClient,
+  custom,
   http,
   MethodNotFoundRpcError,
   toBlobs,
 } from '../../index.js'
+import * as Transaction from '../../tempo/Transaction.js'
+import { withRelay } from '../../tempo/Transport.js'
 import { defineChain, nonceManager } from '../../utils/index.js'
 import { parseEther } from '../../utils/unit/parseEther.js'
 import { parseGwei } from '../../utils/unit/parseGwei.js'
@@ -2216,6 +2220,140 @@ describe('behavior: attemptFill', () => {
     })
 
     expect(fillTransactionSpy).not.toHaveBeenCalled()
+  })
+
+  test('behavior: fully prepared remote fee payer transaction fills through relay once', async () => {
+    const account = privateKeyToAccount(sourceAccount.privateKey)
+    const defaultRequest = vi.fn()
+    const sponsorFeeToken = '0x20c0000000000000000000000000000000000000'
+    const feePayerSignature = {
+      r: '0x1',
+      s: '0x2',
+      yParity: '0x0',
+    } as const
+    const relayRequest = vi.fn(async (request) => ({
+      raw: '0x',
+      tx: {
+        ...(request.params?.[0] as object),
+        feePayerSignature,
+        feeToken: sponsorFeeToken,
+      },
+    }))
+    const tempoClient = createClient({
+      chain: tempoLocalnet,
+      transport: withRelay(
+        custom({ request: defaultRequest }),
+        custom({ request: relayRequest }),
+      ),
+    })
+    const calls = [
+      {
+        data: '0xdeadbeef' as const,
+        to: targetAccount.address,
+        value: 1n,
+      },
+    ]
+    const parameters = {
+      account,
+      calls,
+      chainId: tempoLocalnet.id,
+      feePayer: true,
+      feeToken: '0x20c0000000000000000000000000000000000001' as const,
+      gas: 100_000n,
+      maxFeePerGas: 100n,
+      maxPriorityFeePerGas: 5n,
+      nonce: 7,
+      nonceKey: 1n,
+      type: 'tempo' as const,
+      validAfter: 10,
+      validBefore: 20,
+    } as const
+
+    const request = await prepareTransactionRequest(tempoClient, parameters)
+
+    expect(relayRequest).toHaveBeenCalledOnce()
+    expect(relayRequest.mock.calls[0]?.[0]).toEqual({
+      method: 'eth_fillTransaction',
+      params: [
+        expect.objectContaining({
+          calls: [
+            {
+              data: '0xdeadbeef',
+              to: targetAccount.address,
+              value: '0x1',
+            },
+          ],
+          feePayer: true,
+          gas: '0x186a0',
+          maxFeePerGas: '0x64',
+          maxPriorityFeePerGas: '0x5',
+          nonce: '0x7',
+          validAfter: '0xa',
+          validBefore: '0x14',
+        }),
+      ],
+    })
+    expect(request).toMatchObject({
+      calls,
+      chainId: tempoLocalnet.id,
+      feePayer: true,
+      feePayerSignature: {
+        r: '0x0000000000000000000000000000000000000000000000000000000000000001',
+        s: '0x0000000000000000000000000000000000000000000000000000000000000002',
+        v: 27n,
+        yParity: 0,
+      },
+      feeToken: sponsorFeeToken,
+      gas: 100_000n,
+      maxFeePerGas: 100n,
+      maxPriorityFeePerGas: 5n,
+      nonce: 7,
+      nonceKey: 1n,
+      type: 'tempo',
+      validAfter: 10,
+      validBefore: 20,
+    })
+
+    const serialized = await account.signTransaction(request as never, {
+      serializer: tempoLocalnet.serializers.transaction,
+    })
+    const transaction = Transaction.deserialize(serialized as `0x76${string}`)
+
+    expect(serialized.startsWith('0x76')).toBe(true)
+    expect(transaction.signature).toBeDefined()
+    expect(transaction.feePayerSignature).toBeDefined()
+
+    relayRequest.mockClear()
+
+    await prepareTransactionRequest(tempoClient, {
+      ...parameters,
+      feePayerSignature: { r: '0x1', s: '0x2', yParity: 0 },
+    } as never)
+    await prepareTransactionRequest(tempoClient, {
+      ...parameters,
+      feePayer: accounts[0],
+    })
+
+    expect(relayRequest).not.toHaveBeenCalled()
+    expect(defaultRequest).not.toHaveBeenCalled()
+
+    const nonTempoRequest = vi.fn()
+    const nonTempoClient = createClient({
+      chain: anvilMainnet.chain,
+      transport: custom({ request: nonTempoRequest }),
+    })
+    await prepareTransactionRequest(nonTempoClient, {
+      account,
+      chainId: anvilMainnet.chain.id,
+      gas: 21_000n,
+      maxFeePerGas: 100n,
+      maxPriorityFeePerGas: 5n,
+      nonce: 7,
+      to: targetAccount.address,
+      type: 'eip1559',
+    })
+
+    expect(nonTempoRequest).not.toHaveBeenCalled()
   })
 
   test('behavior: do not attempt fill when parameters do not include fees or gas', async () => {

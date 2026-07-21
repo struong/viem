@@ -383,6 +383,15 @@ export async function prepareTransactionRequest<
     // Do not attempt if `eth_fillTransaction` is not supported.
     if (supportsFillTransaction.get(client.uid) === false) return false
 
+    // Remote fee payers can attach their signature during `eth_fillTransaction`,
+    // even when all ordinary transaction parameters are already populated.
+    if (
+      'feePayer' in request &&
+      request.feePayer === true &&
+      (!('feePayerSignature' in request) || !request.feePayerSignature)
+    )
+      return true
+
     // Should attempt `eth_fillTransaction` if "fees" or "gas" are required to be populated,
     // otherwise, can just use the other individual calls.
     const shouldAttempt = ['fees', 'gas'].some((parameter) =>
